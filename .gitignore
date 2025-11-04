@@ -162,3 +162,6 @@ cython_debug/
 #.idea/
 
 *.h5
+
+slurm/*.out
+fort.99
