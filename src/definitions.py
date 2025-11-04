@@ -1,14 +1,15 @@
 import numpy as np
 import astropy.units as u
 
+
 def get_theorist_runaways(p, teff_thresh=30000, vel_thresh=30, near_thresh=3 * u.kpc):
     """Identify runaway stars in a population of binaries based on theorist criteria
-    
+
     For theorists, we consider the system immediately after the first supernova.
     Either of the following two cases need to be met:
         - System is bound after SN (`sep > 0`), companion has `teff > 30kK`, `vsys_1_total > 30 km/s`
         - Or system is disrupted after SN (`sep < 0`), ejected companion has `teff > 30kK`, `vsys_2_total > 30 km/s`
-    
+
     In both cases the system must be nearby to the sun (within 3 kpc by default).
 
     Parameters
@@ -29,62 +30,81 @@ def get_theorist_runaways(p, teff_thresh=30000, vel_thresh=30, near_thresh=3 * u
     theorist_masks : `dict`
         A dictionary of masks used to identify runaway stars
     """
-    # get the first kick information for each system (only for systems that received a kick)
-    first_kicks = p.kick_info.drop_duplicates(subset="bin_num", keep="first")
-    first_kicks = first_kicks[first_kicks["star"] != 0]
-    
-    # get the evolution information for the system immediately after the first supernova
+    # get the first kick associated with each binary (ignoring any that didn't have a kick)
+    first_kicks = p.kick_info[p.kick_info["star"] != 0].drop_duplicates(subset="bin_num", keep="first")
+
+    # get the bpp rows after the first kick
     first_kick_bpp = p.bpp[p.bpp["evol_type"].isin([15, 16])].drop_duplicates(subset="bin_num", keep="first")
     after_sn_1 = p.bpp.iloc[first_kick_bpp["row_ind"] + 1]
 
-    # define a series of masks to identify runaway stars for the primary and secondary
+    # track the sun's location
+    sun_loc = np.array([8.122, 0, 0]) * u.kpc
+
+    # build some masks for the primary and secondary
     theorist_masks = {
-        "co": {i: after_sn_1[f"kstar_{i}"].isin([13, 14]) for i in [1, 2]},
-        "ms": {i: after_sn_1[f"kstar_{i}"] <= 1 for i in [1, 2]},
-        "hot": {i: after_sn_1[f"teff_{i}"] >= teff_thresh for i in [1, 2]},
-        "fast": {i: first_kicks[f"vsys_{i}_total"] >= vel_thresh for i in [1, 2]},
-        "bound": after_sn_1["sep"] > 0.0,
-        "disrupted": after_sn_1["sep"] < 0.0,
+        "co": {i: after_sn_1[f"kstar_{i}"].isin([13, 14]) for i in [1, 2]},             # is a compact object
+        "ms": {i: after_sn_1[f"kstar_{i}"] <= 1 for i in [1, 2]},                       # is a MS star
+        "hot": {i: after_sn_1[f"teff_{i}"] >= teff_thresh for i in [1, 2]},             # is above T thresh
+        "fast": {i: first_kicks[f"vsys_{i}_total"] >= vel_thresh for i in [1, 2]},      # is fast enough
+        "bound": after_sn_1["sep"] > 0.0,                                               # remained bound
+        "disrupted": after_sn_1["sep"] < 0.0,                                           # got disrupted
         "nearby": {}
     }
 
-    # mask for systems that are nearby to the sun
-    sun_loc = np.array([8.122, 0, 0]) * u.kpc
+    # mask for whether a binary had an SN
+    had_sn = np.isin(p.bin_nums, first_kick_bpp["bin_num"])
+
+    # construct a distance mask for every position
     dist_mask = np.linalg.norm(p.final_pos - sun_loc, axis=1) < near_thresh
 
-    # bound systems are the same as primaries so we just need those
-    bound_nearby = dist_mask[:len(p)]
+    primary_nearby = dist_mask[:len(p)]
+    secondary_nearby = dist_mask[:len(p)]
+    secondary_nearby[p.disrupted] = dist_mask[len(p):]
 
-    # for disrupted systems we can overwrite the nearby mask for the disrupted secondary
-    dis_nearby = dist_mask[:len(p)]
-    dis_nearby[p.disrupted] = dist_mask[len(p):]
+    theorist_masks["nearby"][1] = primary_nearby[had_sn]
+    theorist_masks["nearby"][2] = secondary_nearby[had_sn]
 
-    # then just save it for systems that had a supernova
-    had_sn = np.isin(p.bin_nums, first_kick_bpp["bin_num"])
-    theorist_masks["nearby"][1] = bound_nearby[had_sn]
-    theorist_masks["nearby"][2] = dis_nearby[had_sn]
-    
-    # bound runaway stars are where the system is fast, nearby and contains a compact object + a hot MS star
-    co_plus_o = ((theorist_masks["co"][1] & theorist_masks["ms"][2] & theorist_masks["hot"][2])
-                 | (theorist_masks["co"][2] & theorist_masks["ms"][1] & theorist_masks["hot"][1]))
-    theorist_bound_runaways = (theorist_masks["bound"]
-                               & theorist_masks["fast"][1]
-                               & theorist_masks["nearby"][1]
-                               & co_plus_o)
-    
-    # for disrupted systems the primary will be a compact object so let's just focus on the secondary
-    # this star must be fast, nearby and hot (i.e. an O star)
-    theorist_disrupted_runaways = (theorist_masks["disrupted"]
-                                   & theorist_masks["fast"][2]
-                                   & theorist_masks["ms"][2]
-                                   & theorist_masks["hot"][2]
-                                   & theorist_masks["nearby"][2])
+    # several cases could look like runaways
+    # a) remained bound, one star is CO, other is MS, hot, fast, and nearby
+    bound_runaways = (
+        theorist_masks["bound"]
+        & theorist_masks["fast"][1]
+        & theorist_masks["nearby"][1]
+        & (
+            (theorist_masks["co"][1] & theorist_masks["ms"][2] & theorist_masks["hot"][2])
+            | (theorist_masks["co"][2] & theorist_masks["ms"][1] & theorist_masks["hot"][1])
+          )
+    )
 
-    # mask out the population
-    theorist_runaway_mask = theorist_bound_runaways | theorist_disrupted_runaways
-    theorist_runaway_pop = p[first_kicks["bin_num"].values[theorist_runaway_mask].astype(int)]
-    
+    # a) or, far more likely, got disrupted, and one star is MS, hot, fast, and nearby
+    disrupted_runaways = (
+        theorist_masks["disrupted"]
+        & ((theorist_masks["fast"][1] & theorist_masks["ms"][1]
+            & theorist_masks["hot"][1] & theorist_masks["nearby"][1])
+           | (theorist_masks["fast"][2] & theorist_masks["ms"][2]
+              & theorist_masks["hot"][2] & theorist_masks["nearby"][2]))
+    )
+
+    print(f"Found {np.sum(bound_runaways)} bound runaway candidates and {np.sum(disrupted_runaways)} disrupted runaway candidates")
+
+    theorist_runaway_pop = p[first_kicks["bin_num"].values[bound_runaways | disrupted_runaways].astype(int)]
+
     return theorist_runaway_pop, theorist_masks
+
+
+def get_final_vel_cylindrical(pop):
+    x, y = pop.final_pos[:, 0], pop.final_pos[:, 1]
+    vx, vy, vz = pop.final_vel[:, 0], pop.final_vel[:, 1], pop.final_vel[:, 2]
+
+    # compute cylindrical radius and angle
+    R = np.sqrt(x*x + y*y)
+
+    # radial and tangential components in the disk plane
+    v_R = (x*vx + y*vy) / R
+    v_T = (-y*vx + x*vy) / R
+
+    final_vel_cylindrical = np.vstack([v_R, v_T, vz]).T
+    return final_vel_cylindrical
 
 
 def get_observer_population(p, teff_thresh=30000, vel_thresh=30, near_thresh=3 * u.kpc, v_circ=None):
@@ -110,64 +130,66 @@ def get_observer_population(p, teff_thresh=30000, vel_thresh=30, near_thresh=3 *
     observer_masks : dict
         A dictionary of masks used to identify runaway stars
     """
-    # get the circular velocity at the location of each system if not provided
+    # compute the circular velocity at each star's position if not provided
     if v_circ is None:
         v_circ = p.galactic_potential.circular_velocity(p.final_pos.T)
 
-    # calculate the masks for each observer criterion
-    observer_masks = {
-        "co": {i: p.final_bpp[f"kstar_{i}"].isin([13, 14]) for i in [1, 2]},
-        "ms": {i: p.final_bpp[f"kstar_{i}"] <= 1 for i in [1, 2]},
-        "hot": {i: p.final_bpp[f"teff_{i}"] >= teff_thresh for i in [1, 2]},
-        "nearby": {}
-    }
-
-    # add some shortcuts for the o stars and bound systems
-    observer_masks["o_star"] = {i: observer_masks["ms"][i] & observer_masks["hot"][i] for i in [1, 2]}
-    bound = p.final_bpp["sep"] > 0.0
-    
-    # calculate nearby systems in the same way as ``get_theorist_runaways``
+    # construct a distance mask for every position
     sun_loc = np.array([8.122, 0, 0]) * u.kpc
     dist_mask = np.linalg.norm(p.final_pos - sun_loc, axis=1) < near_thresh
-    bound_nearby = dist_mask[:len(p)]
-    dis_nearby = dist_mask[:len(p)]
-    dis_nearby[p.disrupted] = dist_mask[len(p):]
+    primary_nearby = dist_mask[:len(p)]
+    secondary_nearby = dist_mask[:len(p)]
+    secondary_nearby[p.disrupted] = dist_mask[len(p):]
 
-    observer_masks["nearby"][1] = bound_nearby
-    observer_masks["nearby"][2] = dis_nearby
-    
-    # potential runaways can come in all shapes and sizes (these are masks before considering velocity)
-    # disrupted systems can have runaway stars from secondary if that star is an o star
-    # ignore primary because it will almost always be a compact object unless rarely secondary exploded first
-    pr_dis_2 = p.disrupted & observer_masks["o_star"][2]
-
-    # bound systems can be runaways if there is a compact object and an o star
-    pr_bound = bound & ((observer_masks["co"][1] & observer_masks["o_star"][2])
-                      | (observer_masks["co"][2] & observer_masks["o_star"][1]))
-
-    # mergers can be runaways if there if it is an o star
-    pr_mergers = (p.final_bpp["sep"] == 0.0) & (observer_masks["o_star"][1] | observer_masks["o_star"][2])
-    
-    # transform the circular velocity (v_circ) into cartesian coordinates
-    final_phi = np.arctan2(p.final_pos[:, 1], p.final_pos[:, 0])
-    final_rho = np.sum(p.final_pos[:, :2]**2, axis=1)**(0.5)
-    v_phi = v_circ / final_rho
-    v_circ_x = -final_rho * np.sin(final_phi) * v_phi
-    v_circ_y = final_rho * np.cos(final_phi) * v_phi
-
-    # calculate the relative velocity of each system to the circular velocity
-    rel_vel = np.linalg.norm([p.final_vel[:, 0] - v_circ_x,
-                              p.final_vel[:, 1] - v_circ_y,
-                              p.final_vel[:, 2]], axis=0)
+    # things that are moving fast
+    final_vel_cyl = get_final_vel_cylindrical(p)
+    rel_vel = np.linalg.norm([final_vel_cyl[:, 0], final_vel_cyl[:, 1] - v_circ, final_vel_cyl[:, 2]], axis=0)
     fast = rel_vel > vel_thresh
-    
-    # concatenate all of the candidates that are moving fast enough
-    observer_runaway_nums = np.concatenate((np.intersect1d(p.bin_nums[p.disrupted][fast[len(p):]],      # secondary disrupted and fast
-                                                           p.bin_nums[pr_dis_2 & dis_nearby]),  
-                                            p.bin_nums[(fast[:len(p)] & pr_mergers & bound_nearby)],    # mergers and fast
-                                            p.bin_nums[(fast[:len(p)] & pr_bound & bound_nearby)]))     # bound and fast
-    # de-duplicate the list of runaway stars just in case (shouldn't happen)
+    primary_fast = fast[:len(p)]
+    secondary_fast = fast[:len(p)].copy()
+    secondary_fast[p.disrupted] = fast[len(p):]
+
+    # build some masks for the primary and secondary
+    observer_masks = {
+        "co": {i: p.final_bpp[f"kstar_{i}"].isin([13, 14]) for i in [1, 2]},        # is a compact object
+        "ms": {i: p.final_bpp[f"kstar_{i}"] <= 1 for i in [1, 2]},                  # is a MS star
+        "hot": {i: p.final_bpp[f"teff_{i}"] >= teff_thresh for i in [1, 2]},        # is above T thresh
+        "nearby": {1: primary_nearby, 2: secondary_nearby},
+        "fast": {1: primary_fast, 2: secondary_fast}
+    }
+
+    # define O star masks and bound systems
+    observer_masks["o_star"] = {i: observer_masks["ms"][i] & observer_masks["hot"][i] for i in [1, 2]}
+
+    # for observers, we just need to find a star that's an O star, nearby and moving fast
+    # potential runaways could come in a few different categories
+
+    disrupted_runaways = (
+        (p.final_bpp["sep"] < 0.0)
+        & ((observer_masks["o_star"][1] & observer_masks["nearby"][1] & observer_masks["fast"][1])
+           | (observer_masks["o_star"][2] & observer_masks["nearby"][2] & observer_masks["fast"][2]))
+    )
+
+    bound_runaways = (
+        (p.final_bpp["sep"] > 0.0)
+        & observer_masks["fast"][1]
+        & observer_masks["nearby"][1]
+        & ((observer_masks["co"][1] & observer_masks["o_star"][2])
+           | (observer_masks["co"][2] & observer_masks["o_star"][1]))
+    )
+
+    merger_runaways = (
+        (p.final_bpp["sep"] == 0.0)
+        & (observer_masks["o_star"][1] | observer_masks["o_star"][2])
+        & observer_masks["fast"][1]
+        & observer_masks["nearby"][1]
+    )
+
+    print(f"Found {np.sum(disrupted_runaways)} disrupted runaway candidates, "
+          f"{np.sum(bound_runaways)} bound runaway candidates, and "
+          f"{np.sum(merger_runaways)} merger runaway candidates.")
+
+    observer_runaway_nums = p.bin_nums[disrupted_runaways | bound_runaways | merger_runaways]
     observer_runaway_nums = np.unique(observer_runaway_nums)
-    
-    # mask out the population and return
+
     return p[observer_runaway_nums], observer_masks
